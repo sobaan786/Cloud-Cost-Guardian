@@ -29,7 +29,6 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
-# Updated IAM policy with Cost Explorer permissions
 resource "aws_iam_role_policy" "lambda_policy" {
   name = "cost-guardian-lambda-policy"
   role = aws_iam_role.lambda_role.id
@@ -59,7 +58,6 @@ resource "aws_iam_role_policy" "lambda_policy" {
   })
 }
 
-# Lambda function
 resource "aws_lambda_function" "cost_collector" {
   filename      = "../lambdas/cost-collector/lambda.zip"
   function_name = "cost-guardian-collector"
