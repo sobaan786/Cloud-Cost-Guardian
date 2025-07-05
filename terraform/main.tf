@@ -1,16 +1,20 @@
-# This file tells Terraform what to create in AWS
-
-# Configure the AWS Provider
-provider "aws" {
-  region = "us-east-1"  # Same region from your setup
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
 
-# Create an IAM role for our Lambda function
-# (IAM = Identity and Access Management - it controls permissions)
+provider "aws" {
+  region = "us-east-1"
+}
+
+# IAM role for Lambda
 resource "aws_iam_role" "lambda_role" {
   name = "cost-guardian-lambda-role"
 
-  # This policy says "Lambda service can use this role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -25,39 +29,44 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
-# Attach basic Lambda permissions to our role
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-  role       = aws_iam_role.lambda_role.name
+# Updated IAM policy with Cost Explorer permissions
+resource "aws_iam_role_policy" "lambda_policy" {
+  name = "cost-guardian-lambda-policy"
+  role = aws_iam_role.lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ce:GetCostAndUsage",
+          "ce:GetCostForecast",
+          "ce:GetDimensionValues"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
-# Package our Lambda function code
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_dir  = "../lambdas/cost-collector"
-  output_path = "../lambdas/cost-collector.zip"
-}
-
-# Create the Lambda function
+# Lambda function
 resource "aws_lambda_function" "cost_collector" {
-  filename         = data.archive_file.lambda_zip.output_path
-  function_name    = "cost-guardian-collector"
-  role            = aws_iam_role.lambda_role.arn
-  handler         = "index.lambda_handler"  # filename.function_name
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  runtime         = "python3.9"
-  timeout         = 30  # seconds
+  filename      = "../lambdas/cost-collector/lambda.zip"
+  function_name = "cost-guardian-collector"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "index.handler"
+  runtime       = "python3.9"
+  timeout       = 30  # Increased timeout for API calls
 
-  # Environment variables (we'll use these later)
-  environment {
-    variables = {
-      PROJECT = "cost-guardian"
-    }
-  }
-}
-
-# Output the function name so we know it was created
-output "lambda_function_name" {
-  value = aws_lambda_function.cost_collector.function_name
-  description = "Name of our Lambda function"
+  source_code_hash = filebase64sha256("../lambdas/cost-collector/lambda.zip")
 }
