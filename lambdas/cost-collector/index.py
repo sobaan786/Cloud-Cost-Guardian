@@ -1,27 +1,40 @@
 import json
 import boto3
+import logging
+import os
 from datetime import datetime, timedelta
+from decimal import Decimal
 
-def handler(event, context):
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+def lambda_handler(event, context):
     """
-    Lambda function to collect AWS cost data
+    Cloud Cost Guardian - Automated cost collection and monitoring
+    Triggered daily by EventBridge to collect and analyze AWS costs
     """
-    # Create Cost Explorer client
-    ce_client = boto3.client('ce')
-    
-    # Get dates for the last 7 days
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=7)
     
     try:
+        logger.info("Starting automated cost collection...")
+        
+        # Initialize Cost Explorer client
+        ce_client = boto3.client('ce')
+        
+        # Calculate date range (last 7 days)
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=7)
+        
+        logger.info(f"Collecting costs from {start_date} to {end_date}")
+        
         # Get cost and usage data
         response = ce_client.get_cost_and_usage(
             TimePeriod={
-                'Start': start_date.strftime('%Y-%m-%d'),
-                'End': end_date.strftime('%Y-%m-%d')
+                'Start': str(start_date),
+                'End': str(end_date)
             },
             Granularity='DAILY',
-            Metrics=['UnblendedCost'],
+            Metrics=['BlendedCost'],
             GroupBy=[
                 {
                     'Type': 'DIMENSION',
@@ -30,49 +43,111 @@ def handler(event, context):
             ]
         )
         
-        # Process the results
-        daily_costs = []
-        for result in response['ResultsByTime']:
-            date = result['TimePeriod']['Start']
-            total_cost = 0
-            services = {}
-            
-            for group in result['Groups']:
-                service = group['Keys'][0]
-                cost = float(group['Metrics']['UnblendedCost']['Amount'])
-                services[service] = round(cost, 2)
-                total_cost += cost
-            
-            daily_costs.append({
-                'date': date,
-                'total_cost': round(total_cost, 2),
-                'services': services
-            })
+        # Process the cost data
+        cost_data = process_cost_data(response)
         
-        # Calculate average daily cost
-        total = sum(day['total_cost'] for day in daily_costs)
-        avg_daily_cost = round(total / len(daily_costs), 2) if daily_costs else 0
+        # Log summary for CloudWatch
+        logger.info(f"Cost collection completed. Total 7-day cost: ${cost_data['total_cost']}")
+        logger.info(f"Average daily cost: ${cost_data['avg_daily_cost']}")
+        logger.info(f"Active services: {len(cost_data['daily_breakdown'])}")
+        
+        # Check for any cost anomalies (basic threshold)
+        anomalies = detect_basic_anomalies(cost_data)
+        if anomalies:
+            logger.warning(f"Cost anomalies detected: {anomalies}")
         
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'Cost data collected successfully',
-                'summary': {
-                    'period': f'{start_date} to {end_date}',
-                    'total_cost': round(total, 2),
-                    'average_daily_cost': avg_daily_cost,
-                    'days_analyzed': len(daily_costs)
-                },
-                'daily_costs': daily_costs
-            })
+                'message': 'Cost collection completed successfully',
+                'timestamp': datetime.now().isoformat(),
+                'execution_type': 'automated' if 'source' in event else 'manual',
+                'cost_summary': cost_data,
+                'anomalies': anomalies
+            }, default=decimal_default)
         }
         
     except Exception as e:
-        print(f"Error fetching cost data: {str(e)}")
+        logger.error(f"Error in cost collection: {str(e)}")
         return {
             'statusCode': 500,
             'body': json.dumps({
-                'error': 'Failed to fetch cost data',
-                'details': str(e)
+                'error': 'Cost collection failed',
+                'message': str(e),
+                'timestamp': datetime.now().isoformat()
             })
         }
+
+def process_cost_data(response):
+    """Process and structure the cost data from Cost Explorer"""
+    
+    daily_costs = []
+    total_cost = 0
+    service_totals = {}
+    
+    for result in response['ResultsByTime']:
+        date = result['TimePeriod']['Start']
+        daily_total = 0
+        services = {}
+        
+        for group in result['Groups']:
+            service_name = group['Keys'][0] if group['Keys'] else 'Unknown'
+            cost = float(group['Metrics']['BlendedCost']['Amount'])
+            
+            services[service_name] = cost
+            daily_total += cost
+            
+            # Track service totals
+            if service_name in service_totals:
+                service_totals[service_name] += cost
+            else:
+                service_totals[service_name] = cost
+        
+        daily_costs.append({
+            'date': date,
+            'total_cost': round(daily_total, 4),
+            'services': services
+        })
+        
+        total_cost += daily_total
+    
+    return {
+        'total_cost': round(total_cost, 4),
+        'avg_daily_cost': round(total_cost / 7, 4),
+        'daily_breakdown': daily_costs,
+        'service_totals': service_totals
+    }
+
+def detect_basic_anomalies(cost_data):
+    """Basic anomaly detection - will enhance in Phase 3"""
+    
+    anomalies = []
+    avg_cost = cost_data['avg_daily_cost']
+    
+    # Simple threshold: flag if any daily cost is 50% above average
+    threshold = avg_cost * 1.5
+    
+    for day in cost_data['daily_breakdown']:
+        if day['total_cost'] > threshold and day['total_cost'] > 0.01:  # Ignore tiny amounts
+            anomalies.append({
+                'date': day['date'],
+                'cost': day['total_cost'],
+                'threshold': threshold,
+                'type': 'daily_spike'
+            })
+    
+    # Flag if total cost exceeds $1 (basic budget alert for Free Tier)
+    if cost_data['total_cost'] > 1.0:
+        anomalies.append({
+            'type': 'budget_warning',
+            'total_cost': cost_data['total_cost'],
+            'message': 'Weekly costs exceed $1 - review Free Tier usage'
+        })
+    
+    return anomalies
+
+def decimal_default(obj):
+    """JSON serializer for Decimal objects"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
